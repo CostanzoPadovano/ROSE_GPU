@@ -1,0 +1,29 @@
+name: rose-cuda
+channels:
+  - conda-forge
+  - bioconda
+  - nvidia
+  - defaults
+dependencies:
+  # Python
+  - python=3.11
+  
+  # Bioinformatics
+  - pysam>=0.22
+  - samtools>=1.19
+  - bedtools>=2.31
+  - r-base>=4.3
+  
+  # GPU / CUDA
+  - cuda-toolkit=12.8
+  - cupy
+  
+  # Scientific Python
+  - numpy>=1.26
+  - scipy>=1.12
+  
+  # Utilities
+  - pip
+  
+  - pip:
+    - pycuda>=2024.1
