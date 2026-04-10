@@ -9,6 +9,8 @@ This project was entirely developed and validated using **Google's Antigravity**
 - **CUDA Acceleration**: Custom GPU kernels for BAM read density mapping and interval overlap computation.
 - **Python Optimization**: Replaced legacy `os.system()` calls with `pysam` and `NumPy` vectorization, achieving up to 100x speedup in core modules.
 - **Parallel Orchestration**: Multi-threaded BAM processing and dynamic GPU memory batching for large-scale genomic datasets.
+- **End-to-End GPU Coverage**: All pipeline stages — density mapping, region stitching, and gene mapping — use batch GPU overlap queries.
+- **O(log N) Closest Gene**: Gene-to-enhancer mapping uses binary search (`bisect`) instead of the original 50 Mbp linear scan.
 - **Scientific Reproducibility**: Includes a **COMPAT MODE** that ensures bit-for-bit identical results to the original St. Jude implementation.
 
 ### 🛠 Installation

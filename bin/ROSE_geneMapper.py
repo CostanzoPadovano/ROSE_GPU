@@ -25,7 +25,7 @@ from collections import defaultdict
 
 
 
-def mapEnhancerToGene(annotFile,enhancerFile,transcribedFile='',uniqueGenes=True,byRefseq=False,subtractInput=False):
+def mapEnhancerToGene(annotFile,enhancerFile,transcribedFile='',uniqueGenes=True,byRefseq=False,subtractInput=False, use_gpu=True):
     
     '''
     maps genes to enhancers. if uniqueGenes, reduces to gene name only. Otherwise, gives for each refseq
@@ -56,8 +56,35 @@ def mapEnhancerToGene(annotFile,enhancerFile,transcribedFile='',uniqueGenes=True
 
 
     #this turns the tssLoci list into a LocusCollection
-    #50 is the internal parameter for LocusCollection and doesn't really matter
+    #50 is the internal parameter for LocusCollection and doesn't matter
     tssCollection = ROSE_utils.LocusCollection(tssLoci,50)
+
+    print('PREPARING BATCH QUERIES')
+    enhancerLoci = []
+    proximalSearchLoci = []
+    for line in enhancerTable[6:]:
+        encLocus = ROSE_utils.Locus(line[1],line[2],line[3],'.',line[0])
+        enhancerLoci.append(encLocus)
+        proximalSearchLoci.append(ROSE_utils.makeSearchLocus(encLocus,50000,50000))
+        
+    print('COMPUTING BATCH OVERLAPS')
+    # Use GPU batch overlap for major speedup
+    overlappingLociBatch = transcribedCollection.getBatchOverlapGPU(enhancerLoci, 'both', use_gpu=use_gpu)
+    proximalLociBatch = tssCollection.getBatchOverlapGPU(proximalSearchLoci, 'both', use_gpu=use_gpu)
+    
+    # Prepare TSS lists per chromosome for fast closest gene lookup `O(log N)`
+    import bisect
+    tss_by_chr = defaultdict(list)
+    for locus in tssCollection.getLoci():
+        # Using (center, ID)
+        center = (locus.start() + locus.end()) // 2
+        tss_by_chr[locus.chr()].append((center, locus.ID()))
+        
+    for chrom in tss_by_chr:
+        tss_by_chr[chrom].sort(key=lambda x: x[0])
+        
+    # Extract centers per chrom for bisect
+    tss_centers_by_chr = {chrom: [x[0] for x in tss_by_chr[chrom]] for chrom in tss_by_chr}
 
 
 
@@ -75,61 +102,60 @@ def mapEnhancerToGene(annotFile,enhancerFile,transcribedFile='',uniqueGenes=True
     #have all information
     signalWithGenes = [['GENE_NAME', 'REFSEQ_ID', 'PROXIMAL_STITCHED_PEAKS', 'SIGNAL']]
 
-    for line in enhancerTable[6:]:
+    for i, line in enumerate(enhancerTable[6:]):
 
         enhancerString = '%s:%s-%s' % (line[1],line[2],line[3])
         enhancerSignal = int(float(line[6]))
         if subtractInput: enhancerSignal = int(float(line[6]) - float(line[7]))
 
-        enhancerLocus = ROSE_utils.Locus(line[1],line[2],line[3],'.',line[0])
-
+        enhancerLocus = enhancerLoci[i]
 
         #overlapping genes are transcribed genes whose transcript is directly in the stitchedLocus         
-        overlappingLoci = transcribedCollection.getOverlap(enhancerLocus,'both')           
+        overlappingLoci = overlappingLociBatch[i]
         overlappingGenes =[]
         for overlapLocus in overlappingLoci:                
             overlappingGenes.append(overlapLocus.ID())
 
         #proximalGenes are transcribed genes where the tss is within 50kb of the boundary of the stitched loci
-        proximalLoci = tssCollection.getOverlap(ROSE_utils.makeSearchLocus(enhancerLocus,50000,50000),'both')           
+        proximalLoci = proximalLociBatch[i]
         proximalGenes =[]
         for proxLocus in proximalLoci:
             proximalGenes.append(proxLocus.ID())
 
-
-        distalLoci = tssCollection.getOverlap(ROSE_utils.makeSearchLocus(enhancerLocus,50000000,50000000),'both')           
-        distalGenes =[]
-        for proxLocus in distalLoci:
-            distalGenes.append(proxLocus.ID())
-
-            
-            
         overlappingGenes = ROSE_utils.uniquify(overlappingGenes)
         proximalGenes = ROSE_utils.uniquify(proximalGenes)
-        distalGenes = ROSE_utils.uniquify(distalGenes)
-        allEnhancerGenes = overlappingGenes + proximalGenes + distalGenes
+        
         #these checks make sure each gene list is unique.
-        #technically it is possible for a gene to be overlapping, but not proximal since the
-        #gene could be longer than the 50kb window, but we'll let that slide here
         for refID in overlappingGenes:
             if proximalGenes.count(refID) == 1:
                 proximalGenes.remove(refID)
 
-        for refID in proximalGenes:
-            if distalGenes.count(refID) == 1:
-                distalGenes.remove(refID)
-
-
-        #Now find the closest gene
-        if len(allEnhancerGenes) == 0:
-            closestGene = ''
+        #Now find the closest gene using binary search on the entire chromosome
+        closestGene = ''
+        enhancerCenter = (int(line[2]) + int(line[3])) / 2
+        chrom = line[1]
+        
+        if chrom in tss_centers_by_chr and len(tss_centers_by_chr[chrom]) > 0:
+            centers = tss_centers_by_chr[chrom]
+            chr_tss = tss_by_chr[chrom]
+            idx = bisect.bisect_left(centers, enhancerCenter)
+            
+            candidates = []
+            if idx < len(centers):
+                candidates.append(chr_tss[idx])
+            if idx > 0:
+                candidates.append(chr_tss[idx-1])
+                
+            if candidates:
+                best_candidate = min(candidates, key=lambda x: abs(x[0] - enhancerCenter))
+                closestGeneID = best_candidate[1]
+                
+                # Assign appropriately below
+                closestGeneRawID = closestGeneID
+            else:
+                closestGeneRawID = None
         else:
-            #get enhancerCenter
-            enhancerCenter = (int(line[2]) + int(line[3]))/2
-
-            #get absolute distance to enhancer center
-            distList = [abs(enhancerCenter - startDict[geneID]['start'][0]) for geneID in allEnhancerGenes]
-            closestGene = startDict[allEnhancerGenes[distList.index(min(distList))]]['name']
+            closestGeneRawID = None
 
         #NOW WRITE THE ROW FOR THE ENHANCER TABLE
         newEnhancerLine = line[0:6]
@@ -137,17 +163,27 @@ def mapEnhancerToGene(annotFile,enhancerFile,transcribedFile='',uniqueGenes=True
         if byRefseq:
             newEnhancerLine.append(','.join(ROSE_utils.uniquify([x for x in overlappingGenes])))
             newEnhancerLine.append(','.join(ROSE_utils.uniquify([x for x in proximalGenes])))
-            closestGene = allEnhancerGenes[distList.index(min(distList))]
+            if closestGeneRawID is not None:
+                closestGene = closestGeneRawID
+            else:
+                closestGene = ''
             newEnhancerLine.append(closestGene)
         else:
             newEnhancerLine.append(','.join(ROSE_utils.uniquify([startDict[x]['name'] for x in overlappingGenes])))
             newEnhancerLine.append(','.join(ROSE_utils.uniquify([startDict[x]['name'] for x in proximalGenes])))
-            closestGene = startDict[allEnhancerGenes[distList.index(min(distList))]]['name']
+            if closestGeneRawID is not None:
+                closestGene = startDict[closestGeneRawID]['name'] if closestGeneRawID in startDict else closestGeneRawID
+            else:
+                closestGene = ''
             newEnhancerLine.append(closestGene)
 
 
         #WRITE GENE TABLE
-        signalWithGenes.append([startDict[closestGene]['name'], closestGene, enhancerString, enhancerSignal])
+        if closestGene != '':
+            try:
+                signalWithGenes.append([startDict[closestGene]['name'] if closestGene in startDict else closestGene, closestGene, enhancerString, enhancerSignal])
+            except KeyError:
+                signalWithGenes.append([closestGene, closestGene, enhancerString, enhancerSignal])
 
         newEnhancerLine += line[-2:]
         enhancerToGeneTable.append(newEnhancerLine)
@@ -231,6 +267,8 @@ def main():
                       help = "If flagged will write output by refseq ID and not common name")
     parser.add_option("-c","--control",dest="control",action = 'store_true', default=False,
                       help = "If flagged will subtract input from sample signal")
+    parser.add_option("--no-gpu", dest="no_gpu", action='store_true', default=False,
+                      help="Disable GPU acceleration, use CPU multiprocessing only.")
 
     #RETRIEVING FLAGS
     (options,args) = parser.parse_args()
@@ -278,7 +316,11 @@ def main():
     else:
         transcribedFile = ''
 
-    enhancerToGeneTable,geneToEnhancerTable,withGenesTable = mapEnhancerToGene(annotFile,enhancerFile, uniqueGenes=True, byRefseq=options.refseq, subtractInput=options.control, transcribedFile=transcribedFile)
+    print(('mapping genes to enhancers for %s' % (enhancerFile)))
+    if options.no_gpu:
+        print("Running gene mapping in CPU-only mode")
+        
+    enhancerToGeneTable,geneToEnhancerTable,withGenesTable = mapEnhancerToGene(annotFile,enhancerFile, uniqueGenes=True, byRefseq=options.refseq, subtractInput=options.control, transcribedFile=transcribedFile, use_gpu=not options.no_gpu)
 
     #Writing enhancer output
     enhancerFileName = enhancerFile.split('/')[-1].split('.')[0]
